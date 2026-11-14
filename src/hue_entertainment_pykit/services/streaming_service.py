@@ -4,12 +4,12 @@ This class is responsible for the DTLS connection setup and maintenance, and fac
 transmission to lights in a Philips Hue Entertainment setup.
 """
 
+from collections.abc import Mapping
 import logging
 import queue
 import struct
 import threading
 from socket import error as SocketError
-from typing import Union
 
 from ..models.payload import Payload
 from ..models.entertainment_configuration import (
@@ -23,6 +23,15 @@ from ..utils.converter import Converter
 
 
 logger = logging.getLogger(__name__)
+
+RGBColor = tuple[int, int, int]
+XYBColor = tuple[float, float, float]
+ColorTuple = RGBColor | XYBColor
+StreamInput = (
+    tuple[int, int, int, int]
+    | tuple[float, float, float, int]
+    | Mapping[int, ColorTuple]
+)
 
 
 # pylint: disable=too-many-instance-attributes
@@ -130,6 +139,15 @@ class StreamingService:
         self._stop_event.clear()
         self._is_connection_alive = True
 
+        if self._connection_thread.ident is not None:
+            self._connection_thread = threading.Thread(
+                target=self._keep_connection_alive, daemon=True
+            )
+        if self._processing_thread.ident is not None:
+            self._processing_thread = threading.Thread(
+                target=self._watch_user_input, daemon=True
+            )
+
         self._connection_thread.start()
         self._processing_thread.start()
 
@@ -163,30 +181,26 @@ class StreamingService:
                 "Unable to stop stream: DTLS socket is not available or stream is not active."
             )
 
-    def set_input(
-        self,
-        user_input: Union[tuple[int, int, int, int], tuple[float, float, float, int]],
-    ):
-        """Sets the user input for processing.
-
-        Args:
-            user_input (Union[tuple[int, int, int, int], tuple[float, float, float, int]]): The user input data, either
-            in RGB8 or XYB format, along with a light identifier. The input should be a tuple containing either
-            three integer values (RGB) or three float values (XYB) followed by the light identifier as a string.
-
-            RGB8 min(0) - max(255)
-            XYB min(0.0) - max (1.0)
-        """
-
-        rx, gy, bb, light_id = user_input
-        color = rx, gy, bb
-        logger.info("Setting color(%s, %s, %s) on light %s", rx, gy, bb, light_id)
-        if self._is_valid_rgb8(color) or self._is_valid_xyb(color):
+    def set_input(self, user_input: StreamInput):
+        """Queue a single-channel 4-tuple or channel-to-color mapping for streaming."""
+        if isinstance(user_input, Mapping):
+            if user_input and all(
+                isinstance(ch_id, int)
+                and len(color) == 3
+                and (self._is_valid_rgb8(color) or self._is_valid_xyb(color))
+                for ch_id, color in user_input.items()
+            ):
+                self._input_queue.put(dict(user_input))
+                return
+        elif len(user_input) == 4 and (
+            self._is_valid_rgb8(user_input[:3]) or self._is_valid_xyb(user_input[:3])
+        ):
             self._input_queue.put(user_input)
-        else:
-            logger.error(
-                "Invalid input: values must be a valid rgb8 (0 - 255) or xyb (0.0 - 1.0)"
-            )
+            return
+
+        logger.error(
+            "Invalid input: values must be a valid rgb8 (0 - 255) or xyb (0.0 - 1.0)"
+        )
 
     def _build_message(self, channel_data):
         """Constructs a message for streaming with the given channel data.
@@ -297,41 +311,34 @@ class StreamingService:
                 )
 
     def _process_user_input(self, user_input):
-        """Processes the user input received.
-
-        Args:
-            user_input: The user input to process. The input is expected to be a tuple of either
-            RGB8 or XYB color values along with a light identifier.
-        """
-
-        if len(user_input) != 4:
+        """Process a single-channel 4-tuple or channel-to-color mapping."""
+        items = (
+            [(*color, ch_id) for ch_id, color in user_input.items()]
+            if isinstance(user_input, Mapping)
+            else [user_input]
+        )
+        if not items or any(len(item) != 4 for item in items):
             raise ValueError(f"{user_input} invalid input. Expected 4 values.")
 
-        rx, gy, bb, light_id = user_input
-        color = (rx, gy, bb)
-        if self._is_valid_rgb8(color) or self._is_valid_xyb(color):
-            logger.debug("Processing user input: %s", color)
-            self._send_color_to_light(color, light_id)
-        else:
-            raise ValueError(
-                "Invalid input. Neither inputs are rgb8 or xyb compatible."
-            )
+        packed_channels = []
+        for rx, gy, bb, light_id in items:
+            color = (rx, gy, bb)
+            if not (self._is_valid_rgb8(color) or self._is_valid_xyb(color)):
+                raise ValueError(
+                    "Invalid input. Neither inputs are rgb8 or xyb compatible."
+                )
+            packed_channels.append(self._pack_color_data(color, light_id))
 
-    def _send_color_to_light(
-        self, color: Union[tuple[int, int, int], tuple[float, float, float]], value: int
-    ):
-        """Sends color data to a light.
+        self._send_channel_payload(b"".join(packed_channels))
 
-        Args:
-            color (Union[tuple[int, int, int], tuple[float, float, float]]): The color data to send,
-            either as RGB8 or XYB values.
-            value (int): An integer representing a specific value related to the light, such as its ID or channel.
+    def _send_color_to_light(self, color: ColorTuple, value: int):
+        """Send single-channel color data to a light over DTLS."""
+        self._send_channel_payload(self._pack_color_data(color, value))
 
-        This method packages the color data and sends it over the DTLS connection to the specified light.
-        """
-
+    def _send_channel_payload(self, channel_data: bytes) -> None:
+        """Build and transmit a HueStream frame containing packed channel data."""
         try:
-            self._channel_data = self._pack_color_data(color, value)
+            self._channel_data = channel_data
             message = self._build_message(self._channel_data)
             logger.debug(message)
             self._dtls_service.get_socket().send(message)
@@ -342,9 +349,7 @@ class StreamingService:
                 logger.info("Attempting to reconnect...")
                 self._attempt_reconnect()
 
-    def _pack_color_data(
-        self, color: Union[tuple[int, int, int], tuple[float, float, float]], value: int
-    ) -> bytes:
+    def _pack_color_data(self, color: ColorTuple, value: int) -> bytes:
         """Packs the given color data into bytes for transmission.
 
         Args:

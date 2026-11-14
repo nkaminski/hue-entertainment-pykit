@@ -24,6 +24,7 @@ streamlined interface for building applications that can create immersive lighti
 from .api import Discovery, Streaming, create_bridge, setup_logs, Entertainment
 from .models.bridge import Bridge
 from .models.entertainment_configuration import EntertainmentConfiguration
+from .services.streaming_service import RGBColor, StreamInput, XYBColor
 
 __all__ = [
     "Discovery",
@@ -33,4 +34,7 @@ __all__ = [
     "Bridge",
     "EntertainmentConfiguration",
     "Entertainment",
+    "RGBColor",
+    "StreamInput",
+    "XYBColor",
 ]

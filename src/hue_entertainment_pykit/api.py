@@ -15,7 +15,7 @@ their entertainment features need to be dynamically discovered, configured, and 
 
 import logging
 import re
-from typing import Optional, Union
+from typing import Optional
 
 from .bridge.bridge_repository import BridgeRepository
 from .bridge.entertainment_configuration_repository import (
@@ -28,7 +28,7 @@ from .models.entertainment_configuration import (
 from .network.dtls import Dtls
 from .network.mdns import Mdns
 from .services.discovery_service import DiscoveryService
-from .services.streaming_service import StreamingService
+from .services.streaming_service import StreamInput, StreamingService
 from .utils.logger import LoggingUtil
 
 
@@ -250,22 +250,7 @@ class Streaming:
         """
         self._streaming_service.set_color_space(color_space)
 
-    def set_input(
-        self,
-        input_data: Union[tuple[int, int, int, int], tuple[float, float, float, int]],
-    ):
-        """Sets the input data for the streaming service.
-
-        The input data can be a tuple of either three integers or three floats followed by an integer.
-        The first three values represent color: in RGB format (0-255 range) when integers,
-        or in xyb format (CIE color space, 0.0-1.0 range) for floats, where 'b' stands for brightness.
-        The last integer in both cases is the ID of the light in the chosen Entertainment Area.
-
-        Args:
-            input_data (Union[tuple[int, int, int, int], tuple[float, float, float, int]]):
-                The input data to be used in streaming. This can be either a tuple of three integers (RGB format)
-                or a tuple of three floats (xyb format in CIE color space) followed by an integer (the light ID).
-
-        """
+    def set_input(self, input_data: StreamInput):
+        """Set single-channel tuple or channel-to-RGB/XYB mapping for streaming."""
 
         self._streaming_service.set_input(input_data)

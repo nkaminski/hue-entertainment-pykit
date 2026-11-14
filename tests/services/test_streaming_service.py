@@ -137,6 +137,18 @@ class TestStreamingService(unittest.TestCase):
         self.streaming_service.set_input(valid_input)
         self.assertFalse(self.streaming_service._input_queue.empty())
 
+    def test_process_multi_channel_user_input(self):
+        """Test packing and sending a channel-to-RGB mapping in a single DTLS frame."""
+        mock_socket = MagicMock()
+        self.mock_dtls_service.get_socket.return_value = mock_socket
+        batch = {0: (255, 0, 0), 1: (0, 255, 0)}
+        self.streaming_service.set_input(batch)
+        self.streaming_service._process_user_input(
+            self.streaming_service._input_queue.get_nowait()
+        )
+        mock_socket.send.assert_called_once()
+        self.assertEqual(len(self.streaming_service._channel_data), 14)
+
     def test_process_user_input_invalid(self):
         """
         Tests processing of invalid user input, expecting an error log.

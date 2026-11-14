@@ -145,6 +145,12 @@ streaming.set_color_space("xyb")
 # First three values in the tuple are placeholders for the color RGB8(int) or (in this case) XYB(float) and the last integer is light ID inside the Entertainment API
 streaming.set_input((0.0, 0.63435, 0.3, 0))  # Light command for the first light
 streaming.set_input((0.63435, 0.0, 0.3, 1))  # Light command for the second light
+
+# Or pass a {channel_id: (r, g, b)} / {channel_id: (x, y, b)} map to update multiple lights in a single DTLS frame:
+streaming.set_input({
+    0: (0.0, 0.63435, 0.3),
+    1: (0.63435, 0.0, 0.3),
+})
 # ... Add more inputs as needed for additional lights and logic
 
 # For the purpose of example sleep is used for all inputs to process before stop_stream is called
