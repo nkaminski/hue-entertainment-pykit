@@ -30,9 +30,6 @@ To install Hue Entertainment PyKit, ensure you have Python installed on your sys
 pip install hue-entertainment-pykit
 ```
 
-__Note:__ Python 3.13 and later are currently unsupported due to ___python-mbedtls___ not yet providing compatible 
-wheels. This sucks cause last update was in second quarter of 2024 and it looks like there won't be any anymore.
-
 ---
 
 ## Usage

@@ -8,7 +8,6 @@ import logging
 import queue
 import struct
 import threading
-import time
 from socket import error as SocketError
 from typing import Union
 
@@ -76,10 +75,15 @@ class StreamingService:
         self._channel_data = b""
         self._last_message = self._init_message()
         self._is_connection_alive = False
+        self._stop_event = threading.Event()
 
         self._input_queue = queue.Queue()
-        self._connection_thread = threading.Thread(target=self._keep_connection_alive)
-        self._processing_thread = threading.Thread(target=self._watch_user_input)
+        self._connection_thread = threading.Thread(
+            target=self._keep_connection_alive, daemon=True
+        )
+        self._processing_thread = threading.Thread(
+            target=self._watch_user_input, daemon=True
+        )
 
         self._reconnect_attempts = 0
         self._reconnect_lock = threading.Lock()
@@ -123,6 +127,7 @@ class StreamingService:
         )
         self._entertainment_configuration_repository.put_configuration(payload)
         self._dtls_service.do_handshake()
+        self._stop_event.clear()
         self._is_connection_alive = True
 
         self._connection_thread.start()
@@ -137,6 +142,7 @@ class StreamingService:
 
         if self._dtls_service.get_socket() and self._is_connection_alive:
             self._is_connection_alive = False
+            self._stop_event.set()
 
             self._connection_thread.join(timeout=10)
             self._processing_thread.join(timeout=10)
@@ -235,7 +241,7 @@ class StreamingService:
                 if self._is_connection_alive:
                     logger.info("Attempting to reconnect...")
                     self._attempt_reconnect()
-            time.sleep(self._KEEP_ALIVE_INTERVAL)
+            self._stop_event.wait(self._KEEP_ALIVE_INTERVAL)
 
     def _watch_user_input(self):
         """Monitors and processes user input in a separate thread while the stream is active.
@@ -248,7 +254,7 @@ class StreamingService:
         while self._is_connection_alive:
             try:
                 user_input = self._input_queue.get(
-                    timeout=1
+                    timeout=0.1
                 )  # using timeout to avoid busy waiting
                 self._process_user_input(user_input)
             except queue.Empty:

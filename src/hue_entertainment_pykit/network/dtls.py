@@ -1,252 +1,196 @@
-"""
-This module contains the DtlsService class, which manages Datagram Transport Layer Security (DTLS)
-connections for communication with Philips Hue Bridges. The class is responsible for setting up and
-maintaining DTLS connections, handling key exchanges, and performing necessary handshakes to ensure
-secure communication.
+"""Manage DTLS connections with Philips Hue Bridges using pre-shared keys."""
 
-The DtlsService class abstracts the complexities of DTLS communication, providing a simpler interface
-for establishing and managing these connections. It's designed to work with pre-shared keys for
-authentication, making it suitable for environments where Philips Hue Bridges utilize DTLS for secure
-communication.
-
-Classes:
-- Dtls: Handles DTLS connections with Philips Hue Bridges using pre-shared keys.
-"""
-
-import errno
+from contextlib import suppress
 import logging
-import os
+import select
 import socket
+import threading
 import time
-from typing import Tuple, List
 
-from mbedtls._tls import HandshakeStep, WantReadError, WantWriteError
-from mbedtls.tls import TLSWrappedSocket, DTLSConfiguration, ClientContext
-
-from ..models.bridge import Bridge
+from OpenSSL._util import ffi as _ffi, lib as _lib
+from OpenSSL.SSL import Connection, Context, DTLS_CLIENT_METHOD, Error, WantReadError
 
 from ..exceptions.dtls_handshake_exception import DTLSHandshakeException
-
+from ..models.bridge import Bridge
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_UDP_PORT = 2100
+_DEFAULT_SOCK_TIMEOUT = 5
+_DEFAULT_CIPHERS = ("PSK-AES256-GCM-SHA384",)
+_PSK_CALLBACK_CDEF = (
+    "unsigned int (*)(SSL *, const char *, char *, unsigned int, "
+    "unsigned char *, unsigned int)"
+)
+
 
 class Dtls:
-    """
-    Manages DTLS connections with Philips Hue Bridges using pre-shared keys.
+    """Manage DTLS connections and PSK handshakes with a Philips Hue Bridge."""
 
-    This class is responsible for setting up and maintaining DTLS connections, including handling key exchanges and
-    performing handshakes for secure communication. It provides methods to create the socket, perform handshakes,
-    and close the connection.
-
-    Attributes:
-        _udp_port (int): The UDP port used for the DTLS connection.
-        _server_address (Tuple[str, int]): The server address and port for the DTLS connection.
-        _psk_key (bytes): The pre-shared key for DTLS authentication.
-        _psk_identity (str): The identity associated with the pre-shared key.
-        _ciphers (List[str]): List of ciphers used for the DTLS connection.
-        _dtls_socket (TLSWrappedSocket | None): The DTLS socket used for the connection.
-        _sock_timeout (int): The socket timeout in seconds.
-    """
-
-    def __init__(self, bridge: Bridge):
-        """
-        Initializes the DtlsService with a given bridge.
-
-        Parameters:
-            bridge (Bridge): An instance of Bridge to fetch connection details.
-        """
-
-        self._udp_port: int = 2100
-        self._server_address: Tuple[str, int] = (
+    def __init__(self, bridge: Bridge) -> None:
+        """Initialize the DTLS manager from bridge connection details."""
+        self._udp_port: int = _DEFAULT_UDP_PORT
+        self._server_address: tuple[str, int] = (
             bridge.get_ip_address(),
             self._udp_port,
         )
-        self._psk_key = bytes.fromhex(bridge.get_client_key())
+        self._psk_key: bytes = bytes.fromhex(bridge.get_client_key())
         self._psk_identity: str = bridge.get_hue_application_id()
-        self._ciphers: List[str] = [
-            "TLS-PSK-WITH-AES-256-GCM-SHA384",
-        ]
-        self._dtls_socket: TLSWrappedSocket | None = None
-        self._sock_timeout: int = 5
+        self._ciphers: list[str] = list(_DEFAULT_CIPHERS)
+        self._dtls_socket: Connection | None = None
+        self._sock_timeout: int = _DEFAULT_SOCK_TIMEOUT
+        self._psk_callback = None
 
     def __str__(self) -> str:
-        """
-        Returns a string representation of the DtlsService instance.
-
-        Returns:
-            str: A string describing the DtlsService instance.
-        """
-
+        """Return a string representation of the DTLS configuration."""
         return (
             "DTLS {\n"
-            + f"   server_address: {self._server_address},\n"
-            + f"   psk_key: {self._psk_key},\n"
-            + f"   psk_identity: {self._psk_identity},\n"
-            + f"   ciphers: {self._ciphers}\n"
-            + "}"
+            f"   server_address: {self._server_address},\n"
+            f"   psk_key: {self._psk_key},\n"
+            f"   psk_identity: {self._psk_identity},\n"
+            f"   ciphers: {self._ciphers}\n"
+            "}"
         )
 
     def get_server_address(self) -> tuple[str, int]:
-        """
-        Retrieves the server address and port for the DTLS connection.
-
-        Returns:
-            Tuple[str, int]: The server address and port.
-        """
-
+        """Return the target bridge address and UDP port."""
         return self._server_address
 
-    def get_socket(self) -> TLSWrappedSocket | None:
-        """
-        Gets or creates the DTLS socket for communication.
-
-        Returns the existing DTLS socket or creates a new one if it does not exist, then returns it.
-
-        Returns:
-            TLSWrappedSocket | None: The DTLS socket, or None if unable to create
-        """
-
-        if not self._dtls_socket:
+    def get_socket(self) -> Connection | None:
+        """Return the active DTLS socket, creating one if needed."""
+        if self._dtls_socket is None:
             self._create_dtls_socket()
         return self._dtls_socket
 
-    def _create_dtls_socket(self):
-        """
-        Creates a DTLS socket with the necessary configuration and context.
-        This method is internally used to establish the DTLS connection.
-        """
+    def _create_psk_callback(self):
+        """Create the OpenSSL CFFI callback for Pre-Shared Key authentication."""
+        psk_identity = self._psk_identity.encode("utf-8")
+        psk_key = self._psk_key
 
-        if self._dtls_socket is None:
-            logger.info("Creating DTLS socket and context")
-            config = DTLSConfiguration(
-                pre_shared_key=(self._psk_identity, self._psk_key),
-                ciphers=self._ciphers,
-            )
-            dtls_client = ClientContext(config)
-            udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_socket.settimeout(self._sock_timeout)
-            udp_socket.connect(self._server_address)
-            buffer = dtls_client.wrap_buffers(server_hostname=self._server_address[0])
+        @_ffi.callback(_PSK_CALLBACK_CDEF)
+        def _callback(_ssl, _hint, identity, max_identity_len, psk, max_psk_len):
+            # pylint: disable=too-many-positional-arguments
+            if (
+                b"\x00" in psk_identity
+                or len(psk_identity) + 1 > max_identity_len
+                or len(psk_key) > max_psk_len
+            ):
+                return 0
+            _ffi.memmove(identity, psk_identity, len(psk_identity))
+            identity[len(psk_identity)] = b"\x00"
+            _ffi.memmove(psk, psk_key, len(psk_key))
+            return len(psk_key)
 
-            self._dtls_socket = self.PatchedTLSWrappedSocket(udp_socket, buffer)
+        return _callback
 
-    def do_handshake(self):
-        """
-        Initiates and performs a handshake over the DTLS socket.
+    def _create_dtls_socket(self) -> None:
+        """Create a DTLS socket and OpenSSL context if not already initialized."""
+        if self._dtls_socket is not None:
+            return
 
-        Establishes a DTLS socket if not already present and performs a handshake to initiate secure communication.
-        """
+        logger.info("Creating DTLS socket and context")
+        context = Context(DTLS_CLIENT_METHOD)
+        context.set_cipher_list(":".join(self._ciphers).encode("utf-8"))
+        self._psk_callback = self._create_psk_callback()
+        # pylint: disable=protected-access
+        _lib.SSL_CTX_set_psk_client_callback(context._context, self._psk_callback)
 
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.settimeout(self._sock_timeout)
+        udp_socket.connect(self._server_address)
+
+        self._dtls_socket = self.PatchedTLSWrappedSocket(context, udp_socket)
+        self._dtls_socket.set_connect_state()
+
+    def do_handshake(self) -> None:
+        """Perform the DTLS handshake, closing the socket on failure."""
         self._create_dtls_socket()
         logger.info("Starting DTLS handshake")
-        self._dtls_socket.do_handshake()
+        try:
+            self._dtls_socket.do_handshake()
+        except DTLSHandshakeException:
+            self.close_socket()
+            raise
         logger.info("DTLS handshake established")
 
-    def close_socket(self):
-        """
-        Closes the DTLS socket if it exists and sets it to None.
-        """
+    def close_socket(self) -> None:
+        """Close the active DTLS socket and release callback references."""
+        if self._dtls_socket is None:
+            return
+        self._dtls_socket.close()
+        self._dtls_socket = None
+        self._psk_callback = None
 
-        if self._dtls_socket:
-            self._dtls_socket.close()
-            self._dtls_socket = None
+    # pylint: disable=abstract-method
+    class PatchedTLSWrappedSocket(Connection):
+        """OpenSSL DTLS Connection with handshake retry and thread-safe I/O."""
 
-    class PatchedTLSWrappedSocket(TLSWrappedSocket):
-        """
-        A patched version of `TLSWrappedSocket` that overrides the `do_handshake` method
-        to implement custom handshake logic with retry mechanisms for DTLS connections.
+        _HANDSHAKE_TIMEOUT = 5.0
+        _MAX_HANDSHAKE_RETRIES = 3
 
-        This class addresses specific issues related to handshake retries when using
-        Datagram Transport Layer Security (DTLS) over unreliable networks. It keeps track
-        of handshake attempts and implements a retry logic to ensure a successful handshake.
-        """
-
-        def __init__(self, *args, **kwargs):
-            """
-            Initialize the patched TLS wrapped socket.
-
-            Args:
-                *args: Variable length argument list passed to the parent class.
-                **kwargs: Arbitrary keyword arguments passed to the parent class.
-
-            Attributes:
-                _handshake_retries (int): Counter for the number of handshake attempts.
-            """
-
+        def __init__(self, *args, **kwargs) -> None:
+            """Initialize the wrapped DTLS connection."""
             super().__init__(*args, **kwargs)
-            self._handshake_retries = 0  # Track the number of handshake attempts
+            self._handshake_retries = 0
+            self._send_lock = threading.Lock()
 
-        def do_handshake(self, *args):
-            """
-            Perform the DTLS handshake with retry logic.
+        def do_handshake(self) -> None:
+            """Perform the DTLS handshake with retransmission and deadline bounds."""
+            self._handshake_retries = 0
+            # Enforce an overall wall-clock deadline because select.select() only
+            # increments _handshake_retries when the socket times out waiting for
+            # data. If stray packets, repeated HelloVerifyRequests, or ICMP errors
+            # keep the socket readable without completing the handshake, the loop
+            # would otherwise spin indefinitely.
+            deadline = (
+                time.monotonic()
+                + self._HANDSHAKE_TIMEOUT * self._MAX_HANDSHAKE_RETRIES
+            )
 
-            This method overrides the parent class's `do_handshake` method to include
-            custom retry logic for DTLS handshakes. It handles reading from and writing
-            to the underlying socket, and retransmits the ClientHello message if needed.
-
-            Args:
-                *args: Optional arguments which can be:
-                    - No arguments: Uses default flags and no specific address.
-                    - One argument (`address`): The address to send data to.
-                    - Two arguments (`flags`, `address`): Custom flags and address.
-
-            Raises:
-                OSError: If there is an error with the underlying socket connection.
-                TypeError: If an incorrect number of arguments is provided.
-                DTLSHandshakeException: If the maximum number of handshake retries is exceeded.
-            """
-
-            # pylint: disable=too-many-branches
-            if args and self.type is not socket.SOCK_DGRAM:
-                raise OSError(errno.ENOTCONN, os.strerror(errno.ENOTCONN))
-
-            if len(args) == 0:
-                flags, address = 0, None
-            elif len(args) == 1:
-                flags, address = 0, args[0]
-            elif len(args) == 2:
-                assert isinstance(args[0], int)
-                flags, address = args
-            else:
-                raise TypeError("do_handshake() takes 0, 1, or 2 arguments")
-
-            while self._handshake_state is not HandshakeStep.HANDSHAKE_OVER:
+            while True:
                 try:
-                    self._buffer.do_handshake()
+                    super().do_handshake()
+                    return
                 except WantReadError as exc:
-                    if address is None:
-                        data = self._socket.recv(TLSWrappedSocket.CHUNK_SIZE, flags)
-                    else:
-                        data, addr = self._socket.recvfrom(
-                            TLSWrappedSocket.CHUNK_SIZE, flags
-                        )
-                        if addr != address:
-                            raise OSError(
-                                errno.ENOTCONN, os.strerror(errno.ENOTCONN)
-                            ) from exc
-                    self._buffer.receive_from_network(data)
-                except WantWriteError as exc:
-                    in_transit = self._buffer.peek_outgoing(TLSWrappedSocket.CHUNK_SIZE)
-                    if address is None:
-                        amt = self._socket.send(in_transit, flags)
-                    else:
-                        amt = self._socket.sendto(in_transit, flags, address)
-                    self._buffer.consume_outgoing(amt)
+                    if (remaining := deadline - time.monotonic()) <= 0:
+                        raise DTLSHandshakeException(
+                            "DTLS handshake timed out"
+                        ) from exc
+
+                    timeout = self.DTLSv1_get_timeout()
+                    wait_time = min(
+                        1.0 if timeout is None else max(0.0, timeout),
+                        remaining,
+                    )
+                    ready, _, _ = select.select([self._socket], [], [], wait_time)
+                    if ready:
+                        continue
 
                     self._handshake_retries += 1
                     logger.debug("Retransmission attempt: %s", self._handshake_retries)
-
-                    if self._handshake_retries < 3:
-                        logger.debug("Resending ClientHello")
-                        time.sleep(0.3)
-                        if address is None:
-                            amt = self._socket.send(in_transit, flags)
-                        else:
-                            amt = self._socket.sendto(in_transit, flags, address)
-                        self._buffer.consume_outgoing(amt)
-
-                    if self._handshake_retries > 3:
+                    if self._handshake_retries > self._MAX_HANDSHAKE_RETRIES:
                         raise DTLSHandshakeException(
                             "Maximum handshake retries exceeded"
                         ) from exc
+                    self.DTLSv1_handle_timeout()
+                except Error as exc:
+                    raise DTLSHandshakeException(
+                        f"DTLS handshake failed: {exc}"
+                    ) from exc
+
+        def send(self, buf: bytes, flags: int = 0) -> int:
+            """Send data over DTLS and map OpenSSL errors to OSError."""
+            with self._send_lock:
+                try:
+                    return super().send(buf, flags)
+                except Error as exc:
+                    raise OSError(f"DTLS send failed: {exc}") from exc
+
+        def close(self) -> None:
+            """Shut down the DTLS session and close the underlying UDP socket."""
+            with self._send_lock:
+                if self._socket is None:
+                    return
+                with suppress(Error):
+                    self.shutdown()
+                self._socket.close()
