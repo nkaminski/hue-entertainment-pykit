@@ -181,6 +181,11 @@ class StreamingService:
                 "Unable to stop stream: DTLS socket is not available or stream is not active."
             )
 
+    def turn_off_lights(self) -> None:
+        """Turn off all light services in the entertainment configuration."""
+        for light in self._entertainment_config.light_services:
+            self._entertainment_configuration_repository.turn_off_light(light.rid)
+
     def set_input(self, user_input: StreamInput):
         """Queue a single-channel 4-tuple or channel-to-color mapping for streaming."""
         if isinstance(user_input, Mapping):

@@ -149,6 +149,16 @@ class TestStreamingService(unittest.TestCase):
         mock_socket.send.assert_called_once()
         self.assertEqual(len(self.streaming_service._channel_data), 14)
 
+    def test_turn_off_lights(self):
+        """Test turning off all light services in the entertainment configuration."""
+        self.mock_entertainment_config.light_services = [
+            MagicMock(rid="light-1"),
+            MagicMock(rid="light-2"),
+        ]
+        self.streaming_service.turn_off_lights()
+        self.mock_entertainment_repo.turn_off_light.assert_any_call("light-1")
+        self.mock_entertainment_repo.turn_off_light.assert_any_call("light-2")
+
     def test_process_user_input_invalid(self):
         """
         Tests processing of invalid user input, expecting an error log.

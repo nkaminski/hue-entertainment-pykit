@@ -127,3 +127,8 @@ class EntertainmentConfigurationRepository:
         payload.remove_key("id")
         self._send_request("PUT", url, payload)
         logger.info("Entertainment configuration updated successfully.")
+
+    def turn_off_light(self, light_id: str) -> None:
+        """Turn off a single Hue light resource via CLIP v2."""
+        url = f"https://{self._bridge.get_ip_address()}/clip/v2/resource/light/{light_id}"
+        self._send_request("PUT", url, Payload({"on": {"on": False}}))

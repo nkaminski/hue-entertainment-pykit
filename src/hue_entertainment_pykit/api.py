@@ -254,3 +254,8 @@ class Streaming:
         """Set single-channel tuple or channel-to-RGB/XYB mapping for streaming."""
 
         self._streaming_service.set_input(input_data)
+
+    def turn_off_lights(self) -> None:
+        """Turn off all lights in the entertainment configuration."""
+
+        self._streaming_service.turn_off_lights()
